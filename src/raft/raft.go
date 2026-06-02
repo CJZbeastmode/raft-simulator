@@ -61,6 +61,28 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+
+	// Persistent state
+	currentTerm int
+	votedFor	int
+	log			[]LogEntry
+
+	// Volatile state
+	commitIndex int
+	lastApplied int
+
+	// Volatile state on leaders
+	nextIndex 	[]int
+	matchIndex 	[]int
+
+	// bookkeeping
+	state		string  		// follower, candidate, leader
+	lastHeartbeat time.Time
+}
+
+type LogEntry struct {
+	term int
+	command interface{}
 }
 
 // return currentTerm and whether this server
@@ -122,22 +144,33 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	term			int
+	candidateId		int
+	lastLogIndex	int
+	lastLogTerm		int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	term 			int
+	voteGranted		bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// TODO Day 2: implement properly
+	reply.voteGranted = false
+	reply.term = rf.currentTerm
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -246,6 +279,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = make([]LogEntry, 1)
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.state = "follower"
+	rf.lastHeartbeat = time.Now()
+	
+	go rf.electionTimeoutLoop()
+
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -255,4 +298,32 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 
 	return rf
+}
+
+
+// Election timeout loop to start elections when necessary
+func (rf *Raft) electionTimeoutLoop() {
+	// Loop until the node is killed
+	for !rf.killed() {
+		// 250~400 ms random waiting time, higher to allow heartbeat to arrive first
+		sleepDuration := time.Duration(250 + rand.Intn(150)) * time.Millisecond
+		time.Sleep(sleepDuration)
+
+		// Lock RF to prevent concurrency
+		// Start RF operations
+		rf.mu.Lock()
+		// Start election if RF is not leader or not received heartbeat during sleeping --> leader suspicious dead / no leader
+		if rf.state != "leader" && time.Since(rf.lastHeartbeat) >= sleepDuration {
+			rf.startElection()
+		}
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) startElection() {
+	rf.state = "candidate"		// change back to candidate
+	rf.currentTerm ++ 			// raise term
+	rf.votedFor = rf.me			// vote for himself
+
+	// TODO Day 2: send RequestVote RPCs
 }
