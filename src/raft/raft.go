@@ -71,9 +71,9 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 
-	// Volatile state on leaders
-	nextIndex 	[]int
-	matchIndex 	[]int
+	// Volatile state, only needed by leaders
+	nextIndex 	[]int			// next log entry sent to each peer, gradually fall back if peer not up to date 
+	matchIndex 	[]int			// matching index of the log for each peer
 
 	// bookkeeping
 	state		string  		// follower, candidate, leader
@@ -81,18 +81,20 @@ type Raft struct {
 }
 
 type LogEntry struct {
-	term int
-	command interface{}
+	Term int
+	Command interface{}
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
 	// Your code here (3A).
-	return term, isleader
+
+	// Isolated get
+	rf.mu.Lock()
+    defer rf.mu.Unlock()
+    return rf.currentTerm, rf.state == "leader"
 }
 
 // save Raft's persistent state to stable storage,
@@ -148,18 +150,18 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
-	term			int
-	candidateId		int
-	lastLogIndex	int
-	lastLogTerm		int
+	Term			int
+	CandidateId		int
+	LastLogIndex	int
+	LastLogTerm		int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
-	term 			int
-	voteGranted		bool
+	Term 			int
+	VoteGranted		bool
 }
 
 // example RequestVote RPC handler.
@@ -168,9 +170,37 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// TODO Day 2: implement properly
-	reply.voteGranted = false
-	reply.term = rf.currentTerm
+	reply.VoteGranted = false
+	reply.Term = rf.currentTerm
+
+	// 1, Stale candidate --> reject
+	if args.Term < rf.currentTerm { return }
+
+	// 2, higher than itself --> update and demote
+	if args.Term > rf.currentTerm { 
+		rf.currentTerm = args.Term
+		rf.state = "follower"
+		rf.votedFor = -1 
+	}
+
+	// 3, already voted --> reject
+	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		return 
+	}
+
+	// 4, check 
+	lastIndex := len(rf.log) - 1
+	lastTerm := rf.log[lastIndex].Term
+	logOk := args.LastLogTerm > lastTerm || (args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)
+			// more up to date than cur		// exact up to date term, but whoever has more entries is more up-to-date. 
+	if !logOk {return}	// reject if not satisfied
+
+	// Grant vote
+	reply.VoteGranted = true
+
+	// Update heartbeat time and votedfor
+	rf.votedFor = args.CandidateId
+	rf.lastHeartbeat = time.Now()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -324,6 +354,159 @@ func (rf *Raft) startElection() {
 	rf.state = "candidate"		// change back to candidate
 	rf.currentTerm ++ 			// raise term
 	rf.votedFor = rf.me			// vote for himself
+	votes := 1   				// votes count
+	term := rf.currentTerm 		// snapshot term
 
-	// TODO Day 2: send RequestVote RPCs
+	// loop through all peers and request vote
+	for i := range rf.peers {
+		// skip myself
+		if i == rf.me {
+			continue
+		}
+
+		// wrap in go for parallel programming
+		go func(peer int) {
+			// construct requestVotes
+			args := &RequestVoteArgs{
+				Term: term,									// this term
+				CandidateId: rf.me,							// himself
+				LastLogIndex: len(rf.log) - 1,				// last Log
+				LastLogTerm: rf.log[len(rf.log) - 1].Term,	// last Log Term
+			}
+			reply := &RequestVoteReply{}
+
+			// call RPC
+			ok := rf.peers[peer].Call("Raft.RequestVote", args, reply) 
+			if !ok { return }
+
+			// lock to prevent concurrency
+			rf.mu.Lock()
+			defer rf.mu.Unlock() // unlock automatically upon exit of function
+
+			// Stale data --> ignore (things might get updated during the loop, example: winning already)
+			if rf.currentTerm != term || rf.state != "candidate" {
+				return 
+			}
+
+			// See someone with higher term --> step down
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term		// update term
+				rf.state = "follower"			// change back to follwer
+				rf.votedFor = -1				// reinit votedFor
+				return
+			}
+
+			// Increment vote if vote is granted
+			if reply.VoteGranted {
+				votes ++ 
+				// if majority than win automatic
+				if votes >= len(rf.peers)/2 + 1 {
+					rf.becomeLeader()
+				}
+			}
+		}(i)
+	}
+}
+
+
+func (rf *Raft) becomeLeader() {
+    rf.state = "leader"
+    // Initialize leader-only state
+    rf.nextIndex = make([]int, len(rf.peers))
+    rf.matchIndex = make([]int, len(rf.peers))
+    for i := range rf.peers {
+        rf.nextIndex[i] = len(rf.log) // start optimistic, then gradually fall back
+        rf.matchIndex[i] = 0 // assume that we have confirmed nothing yet
+    }
+    go rf.heartbeatLoop()
+}
+
+
+func (rf *Raft) heartbeatLoop() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		// check if still leader while doing this
+		if rf.state != "leader" {
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
+		
+		// if not leader, send heartbeat to all
+		rf.sendHeartbeats()
+		// wait 100 ms before next round of heartbeat
+		// shorter than election timeout -->
+			// If heartbeats arrive slower than the timeout
+			// followers will think the leader died and start unnecessary elections
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (rf *Raft) sendHeartbeats() {
+	// get current term without concurrency
+	rf.mu.Lock()
+	term := rf.currentTerm
+	rf.mu.Unlock()
+
+	// loop to send heartbeat
+	for i := range rf.peers {
+		// skip himself
+		if i == rf.me { continue }
+
+		// parallel programming
+		go func(peer int) {
+			// Construct and call AppendEntries
+			args := &AppendEntriesArgs{
+				Term: term,
+				LeaderId: rf.me,
+			}
+			reply := &AppendEntriesReply{}
+			rf.peers[peer].Call("Raft.AppendEntries", args, reply)
+
+			// Lock to prevent concurrency
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			// Find out himself is stale --> demote
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.state = "follower"
+				rf.votedFor = -1
+			}
+		}(i)
+	}
+}
+
+type AppendEntriesArgs struct {
+	Term 		int				// current Term
+	LeaderId	int				// heartbeat from node LeaderID
+	// TODO 2B: more fields, 
+	// prevLogIndex		int
+	// prevLogTerm		int
+	// entries			[]int
+	// leaderCommit		int
+}
+
+type AppendEntriesReply struct {
+	Term 		int
+	Success 	bool
+}
+
+
+// Heartbeat + replicate logs
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.Success = false
+
+	// stale leader, ignore
+	if args.Term < rf.currentTerm { return }
+
+	// valid heartbeat - reset election timer
+	rf.lastHeartbeat = time.Now()		// reset last heartbeat
+	rf.state = "follower"				// reset to follower
+	rf.currentTerm = args.Term			// update term
+	reply.Success = true				// return true
 }
