@@ -68,8 +68,10 @@ type Raft struct {
 	log			[]LogEntry
 
 	// Volatile state
-	commitIndex int
-	lastApplied int
+	commitIndex int				// Log exists in majority of servers, but not applied/executed
+								// "last entry we know is safe to hand upstairs"
+	lastApplied int				// Entry handled by layer above (KV store, application, etc.)
+								// "last entry we handed upstairs"
 
 	// Volatile state, only needed by leaders
 	nextIndex 	[]int			// leader's guess at what index to send next to that follower, gradually fall back if not identical
@@ -80,6 +82,9 @@ type Raft struct {
 	// bookkeeping
 	state		string  		// follower, candidate, leader
 	lastHeartbeat time.Time
+
+	// to verify that all servers applied the same commands in the same order
+	applyCh chan ApplyMsg		// output pipe
 }
 
 type LogEntry struct {
@@ -339,6 +344,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.state = "follower"
 	rf.lastHeartbeat = time.Now()
+	rf.applyCh = applyCh
 	
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -346,7 +352,38 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.electionTimeoutLoop()
 
+	// start apply loop
+	go rf.applyLoop()
+
 	return rf
+}
+
+
+// Bridge the gap between commit and apply
+// Send commited logs upward for application
+// Background routine
+func (rf *Raft) applyLoop() {
+	// Loop until cut
+	for !rf.killed() {
+		// 10 ms gap between loops, background pause
+		time.Sleep(10 * time.Millisecond)
+
+		rf.mu.Lock()
+		// Check gap and move forward
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied ++ 
+			msg := ApplyMsg {
+				CommandValid: 	true,
+				Command: 		rf.log[rf.lastApplied].Command,
+				CommandIndex: 	rf.lastApplied,
+			}
+			// Temp unlock to send msg
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			rf.mu.Lock()
+		}
+		rf.mu.Unlock()
+	}	
 }
 
 
@@ -464,7 +501,7 @@ func (rf *Raft) heartbeatLoop() {
 func (rf *Raft) sendHeartbeats() {
 	// get current terms and info without concurrency
 	rf.mu.Lock()
-	term := rf.currentTerm
+	term := rf.currentTerm			// Snapshot, but keep checking during the loop that it is leader
 	LeaderId := rf.me
 	commitIndex := rf.commitIndex
 	rf.mu.Unlock()
@@ -536,13 +573,53 @@ func (rf *Raft) sendHeartbeats() {
 				if newMatch > rf.matchIndex[peer] {
 					rf.matchIndex[peer] = newMatch
 				}
+
 				// set nextIndex
 				rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+
+				// update commit indices if majority has been reached
+				rf.maybeAdvanceCommitIndex()
 			} else { 	// On Failure
 				// back up one and retry next heartbeat
+				// more GPC calls
+				/*
 				if rf.nextIndex[peer] > 1 {
 					rf.nextIndex[peer] --
 				}
+				*/
+
+				// Use hint by the follower to avoid gradual try
+				if reply.ConflictTerm == -1 {
+					// Follower said "I don't even have that index"
+					// Jump directly to where their log ends
+					// No point sending anything before that
+					rf.nextIndex[peer] = reply.ConflictIndex
+				} else {
+					newIndex := -1
+					// searches its own log backwards for the conflicting term.
+					for j := len(rf.log) - 1; j >= 1; j -- {
+						// stop at first found
+						if rf.log[j].Term == reply.ConflictTerm {
+							newIndex = j + 1
+							break
+						}
+					}
+
+					if newIndex == -1 {
+						// Leader doesn't have that term at all
+       					// Follower has entries leader never had → overwrite from ConflictIndex
+						rf.nextIndex[peer] = reply.ConflictIndex
+					} else {
+						// Leader has that term → start sending from just past it
+						rf.nextIndex[peer] = newIndex
+					}
+				}
+
+				// Safety floor — nextIndex can never go below 1 because index 0 is the sentinel entry that always exists on every server.
+				if rf.nextIndex[peer] < 1 {
+					rf.nextIndex[peer] = 1
+				}
+	
 			}
 
 		}(i)
@@ -561,6 +638,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term 		int
 	Success 	bool
+
+	// For faster fallback only
+	ConflictTerm  int  // term of the conflicting entry (-1 if log too short)
+    ConflictIndex int  // first index of that conflicting term
 }
 
 
@@ -571,6 +652,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
+	// init conflict term and index to avoid automatic init to 0
+	//
+	reply.ConflictTerm = -1
+	reply.ConflictIndex = 0
 
 	// stale leader, ignore
 	if args.Term < rf.currentTerm { return }
@@ -581,10 +666,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.currentTerm = args.Term			// update term
 	reply.Term = rf.currentTerm
 
+	// find out where the conflict term is and send/tell the leader
 	// no entry at PrevLogIndex in the log --> reject
-	if args.PrevLogIndex >= len(rf.log) { return }
+	if args.PrevLogIndex >= len(rf.log) { 
+		// for faster fallback only: 
+		// set it in a way that shows it it too short
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = len(rf.log)
+		return 
+	}
 	// entry at PrevLogIndex is wrong --> reject
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm { return }
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm { 
+		// for faster fallback only:
+		// update conflictTerm
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.ConflictIndex = args.PrevLogIndex
+		// walk back to find first index of this conflicting term
+		for reply.ConflictIndex > 1 && rf.log[reply.ConflictIndex - 1].Term == reply.ConflictTerm {
+			reply.ConflictIndex --
+		}
+		return 
+	}
 
 	// append new entries and correct existing wrong entries, to be identical to leader
 	// loop through all entries
@@ -627,3 +729,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = true	// return true
 }
+
+
+// Check whether any index has been replicated on majority
+func (rf *Raft) maybeAdvanceCommitIndex() {
+	// Loop through all index above commited index
+	for n := rf.commitIndex + 1; n < len(rf.log); n ++ {
+		// Only commit entries from the current term 
+		if rf.log[n].Term != rf.currentTerm { continue }
+
+		// Count how many peers have replicated up to n
+		count := 1
+		for i := range rf.peers {
+			if i != rf.me && rf.matchIndex[i] >= n {
+				count ++
+			}
+		}
+
+		// If majority --> commitIndex
+		if count >= len(rf.peers) / 2 + 1 {
+			rf.commitIndex = n
+		}
+	}
+}
+
