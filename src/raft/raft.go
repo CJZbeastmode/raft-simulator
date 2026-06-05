@@ -18,13 +18,13 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -113,34 +113,45 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+
+	w := new(bytes.Buffer)				// create an in-memory byte buffer
+	e := labgob.NewEncoder(w)			// wrap it with an encoder
+	e.Encode(rf.currentTerm)			// serialize currentTerm into the buffer
+	e.Encode(rf.votedFor)				// serialize votedFor
+	e.Encode(rf.log)					// serialize the entire log slice
+	raftstate := w.Bytes()				// extract the raw bytes
+	rf.persister.Save(raftstate, nil)	// hand to the persister (nil = no snapshot yet)
 }
+
 
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	// Your code here (3C).
+	
+	// first boot, nothing saved yet — start fresh
+	if data == nil || len(data) < 1 {
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	r := bytes.NewBuffer(data)			// wrap the raw bytes in a reader
+	d := labgob.NewDecoder(r)			// wrap with a decoder
+	
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+
+	// decode error — ignore, start fresh
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+			return
+		}
+
+	// restore the fields
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log = log
 }
 
 
@@ -188,7 +199,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.state = "follower"
 		rf.votedFor = -1 
+		// !! Store in persistet
+		rf.persist()
 	}
+
+
 
 	// 3, already voted --> reject
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
@@ -212,6 +227,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// Update heartbeat time and votedfor
 	rf.votedFor = args.CandidateId
+	// Store it in persistency
+	rf.persist()
 	rf.lastHeartbeat = time.Now()
 }
 
@@ -279,6 +296,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, entry)
 	index := len(rf.log) - 1
 	term := rf.currentTerm
+	// Persist log
+	rf.persist()
 
 	// Send heartbeats to inform the peers that it is the leader
 	go rf.sendHeartbeats()
@@ -410,6 +429,8 @@ func (rf *Raft) startElection() {
 	rf.state = "candidate"		// change back to candidate
 	rf.currentTerm ++ 			// raise term
 	rf.votedFor = rf.me			// vote for himself
+	// Persistence
+	rf.persist()
 	votes := 1   				// votes count
 	term := rf.currentTerm 		// snapshot term
 
@@ -449,6 +470,8 @@ func (rf *Raft) startElection() {
 				rf.currentTerm = reply.Term		// update term
 				rf.state = "follower"			// change back to follwer
 				rf.votedFor = -1				// reinit votedFor
+				// Persist
+				rf.persist()
 				return
 			}
 
@@ -560,6 +583,8 @@ func (rf *Raft) sendHeartbeats() {
 				rf.currentTerm = reply.Term
 				rf.state = "follower"
 				rf.votedFor = -1
+				// Persist
+				rf.persist()
 			}
 
 			// On Success
@@ -653,7 +678,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 	// init conflict term and index to avoid automatic init to 0
-	//
 	reply.ConflictTerm = -1
 	reply.ConflictIndex = 0
 
@@ -664,6 +688,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastHeartbeat = time.Now()		// reset last heartbeat
 	rf.state = "follower"				// reset to follower
 	rf.currentTerm = args.Term			// update term
+	// Persist
+	rf.persist()
 	reply.Term = rf.currentTerm
 
 	// find out where the conflict term is and send/tell the leader
@@ -713,6 +739,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			break // all appended, therefore break
 		}
 	}
+	// Persist log
+	rf.persist()
 
 	// Logic to set commitIndex
 	if args.LeaderCommit > rf.commitIndex {
@@ -752,4 +780,3 @@ func (rf *Raft) maybeAdvanceCommitIndex() {
 		}
 	}
 }
-
